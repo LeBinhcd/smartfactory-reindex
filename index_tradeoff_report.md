@@ -1,32 +1,46 @@
-# SmartFactory index trade-off report
+﻿# Báo cáo tối ưu chỉ mục cho SmartFactory
 
-## Diagnosis
+## 1. Phân tích vấn đề
 
-The legacy `idx_fat_covering` index contains every column required by the dashboard query: `sensor_id`, `recorded_at`, `temperature`, `humidity`, and `status`. This can produce a covering-index plan, allowing MySQL to answer the `SELECT` without looking up the clustered table record. The read benefit is real, but it is unsuitable as the default design for a high-ingest IoT table.
+Ban đầu, bảng `SensorLogs` sử dụng chỉ mục `idx_fat_covering` gồm các cột `sensor_id`, `recorded_at`, `temperature`, `humidity` và `status`. Cách làm này giúp truy vấn trên Dashboard nhanh vì MySQL có thể lấy đủ dữ liệu ngay trong cây chỉ mục mà không cần quay lại bảng gốc. Đây là trường hợp thường được gọi là **Covering Index**.
 
-Every inserted sensor row must also be inserted into the secondary B-Tree. The extra decimal and string values make index records wider, so more pages are written, cached, and potentially split. This is the write penalty: faster reads are purchased with slower inserts, more RAM pressure, larger backups, and higher storage cost. Values such as temperature, humidity, and status are payload columns, not filtering columns for this dashboard query.
+Tuy nhiên, SmartFactory là hệ thống nhận dữ liệu liên tục từ cảm biến. Mỗi bản ghi mới không chỉ được thêm vào bảng mà còn phải được thêm vào chỉ mục phụ. Vì chỉ mục cũ chứa quá nhiều cột, mỗi phần tử trong cây B-Tree trở nên lớn hơn, cần nhiều page lưu trữ hơn và tốn thêm RAM, thao tác ghi, redo log cũng như chi phí backup. Như vậy, tốc độ đọc được cải thiện nhưng tốc độ ghi và dung lượng lưu trữ bị ảnh hưởng nghiêm trọng.
 
-The replacement `idx_lean_search(sensor_id, recorded_at)` contains only the predicates used to locate the time range. After the lookup, InnoDB fetches `temperature`, `humidity`, and `status` from the clustered primary-key record. The optimized plan still uses `idx_lean_search` with `range` access, but no longer shows `Using index`; it reports `Using index condition`, because the secondary index is no longer covering.
+Các cột `temperature`, `humidity` và `status` là dữ liệu kết quả cần trả về, không phải dữ liệu dùng để lọc trong câu truy vấn Dashboard. Vì vậy, việc đưa toàn bộ các cột này vào index là không cần thiết.
 
-## Measurement log
+## 2. Thiết kế chỉ mục mới
 
-The script was executed locally on MySQL 8.0.46 with approximately 10,000 sample telemetry rows.
+Tôi thay thế chỉ mục cũ bằng:
 
-| Measurement | Data (MB) | Index (MB) | Total (MB) |
+```sql
+CREATE INDEX idx_lean_search
+ON SensorLogs(sensor_id, recorded_at);
+```
+
+Hai cột này đủ để MySQL tìm đúng cảm biến và giới hạn khoảng thời gian cần xem. Sau khi tìm được các dòng phù hợp, InnoDB sẽ đọc thêm `temperature`, `humidity` và `status` từ bảng gốc thông qua khóa chính.
+
+Đổi lại, truy vấn sẽ không còn được bao phủ hoàn toàn bởi index. Tuy nhiên, với hệ thống có hàng chục nghìn bản ghi ghi vào mỗi giây, việc giảm kích thước index và giảm chi phí cập nhật khi `INSERT` là quan trọng hơn việc tiết kiệm một lần đọc bảng.
+
+## 3. Kết quả kiểm tra
+
+Script được chạy trên MySQL 8.0.46 với khoảng 10.000 bản ghi mẫu.
+
+| Trạng thái | Data (MB) | Index (MB) | Tổng (MB) |
 |---|---:|---:|---:|
-| With fat covering index | 0.02 | 0.00 | 0.02 |
-| With lean search index | 0.02 | 0.00 | 0.02 |
+| Có fat covering index | 0.02 | 0.00 | 0.02 |
+| Có lean search index | 0.02 | 0.00 | 0.02 |
 
-The displayed values are rounded and the test table is too small for a visible `INDEX_LENGTH` difference; both states report allocated index length as 0.00 MB. The execution plans provide the important structural proof:
+Do bảng thử nghiệm còn nhỏ và số liệu được làm tròn, `INDEX_LENGTH` chưa thể hiện sự khác biệt rõ ràng. Trên bảng thực tế có hàng triệu bản ghi, phần chênh lệch sẽ dễ quan sát hơn.
 
-| State | Type | Key | Extra |
+Kết quả `EXPLAIN` cho thấy:
+
+| Trạng thái | Type | Key | Extra |
 |---|---|---|---|
-| Fat index | range | `idx_fat_covering` | `Using where; Using index` |
-| Lean index | range | `idx_lean_search` | `Using index condition` |
+| Index cũ | range | `idx_fat_covering` | `Using where; Using index` |
+| Index mới | range | `idx_lean_search` | `Using index condition` |
 
-The final `SHOW INDEX` confirms that only the primary key and `idx_lean_search` remain. On a production-scale table, compare `INDEX_LENGTH` and filesystem usage using the real telemetry volume.
+Sau tối ưu, truy vấn vẫn sử dụng index với kiểu `range`, nhưng không còn `Using index`. Điều này đúng với mục tiêu của bài vì dữ liệu nhiệt độ, độ ẩm và trạng thái đã được lấy từ bảng gốc thay vì lưu thêm trong index.
 
-## Design boundary
+## 4. Kết luận
 
-A covering index is not always wrong. For a small, mostly-read `Countries` reference table, the write penalty may be negligible and avoiding table lookups can be worthwhile. For SmartFactory's continuous append workload, the lean index is the better balance between read latency, insert throughput, RAM, and cloud storage.
-
+Covering Index không phải lúc nào cũng xấu. Với bảng nhỏ, ít thay đổi và chủ yếu phục vụ đọc, nó có thể giúp truy vấn nhanh hơn. Nhưng với bảng dữ liệu cảm biến liên tục phát sinh bản ghi, index quá lớn sẽ tạo ra write penalty, làm tăng thời gian `INSERT`, dung lượng RAM và chi phí ổ đĩa. Chỉ mục tinh gọn `(sensor_id, recorded_at)` phù hợp hơn với bài toán SmartFactory vì cân bằng được tốc độ đọc, tốc độ ghi và chi phí lưu trữ.
